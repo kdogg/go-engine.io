@@ -16,6 +16,8 @@ import (
 
 type MessageType message.MessageType
 
+const KK = true
+
 const (
 	MessageBinary MessageType = MessageType(message.MessageBinary)
 	MessageText   MessageType = MessageType(message.MessageText)
@@ -131,6 +133,27 @@ func (c *serverConn) NextReader() (MessageType, io.ReadCloser, error) {
 	return MessageType(ret.MessageType()), ret, nil
 }
 
+// KK vvvvvvvvvvvvvvvvvvvvvv
+type lockingWriteCloser struct {
+	w   io.WriteCloser
+	mut *sync.Mutex
+}
+
+func (l *lockingWriteCloser) Close() error {
+	l.mut.Lock()
+	defer l.mut.Unlock()
+	return l.w.Close()
+}
+
+func (l *lockingWriteCloser) Write(p []byte) (int, error) {
+	l.mut.Lock()
+	defer l.mut.Unlock()
+	n, err := l.w.Write(p)
+	return n, err
+}
+
+// KK ^^^^^^^^^^^^^^^^^^^^^^
+
 func (c *serverConn) NextWriter(t MessageType) (io.WriteCloser, error) {
 	switch c.getState() {
 	case stateUpgrading:
@@ -139,8 +162,24 @@ func (c *serverConn) NextWriter(t MessageType) (io.WriteCloser, error) {
 	default:
 		return nil, io.EOF
 	}
-	ret, err := c.getCurrent().NextWriter(message.MessageType(t), parser.MESSAGE)
-	return ret, err
+
+	if KK {
+		ret, err := func() (io.WriteCloser, error) {
+			c.writerLocker.Lock()
+			defer c.writerLocker.Unlock()
+			ret, err := c.getCurrent().NextWriter(message.MessageType(t), parser.MESSAGE)
+
+			r2 := &lockingWriteCloser{
+				w:   ret,
+				mut: &c.writerLocker,
+			}
+			return r2, err
+		}()
+		return ret, err
+	} else {
+		ret, err := c.getCurrent().NextWriter(message.MessageType(t), parser.MESSAGE)
+		return ret, err
+	}
 }
 
 func (c *serverConn) Close() error {
@@ -189,18 +228,43 @@ func (c *serverConn) OnPacket(r *parser.PacketDecoder) {
 	case parser.CLOSE:
 		c.getCurrent().Close()
 	case parser.PING:
+
 		t := c.getCurrent()
 		u := c.getUpgrade()
-		newWriter := t.NextWriter
+		newWriter := t.NextWriter // KK this WriteCloser needs to aquire the lock
+
 		if u != nil {
-			if w, _ := t.NextWriter(message.MessageText, parser.NOOP); w != nil {
-				w.Close()
+
+			if KK {
+				func() {
+					c.writerLocker.Lock()
+					defer c.writerLocker.Unlock()
+					if w, _ := t.NextWriter(message.MessageText, parser.NOOP); w != nil {
+						w.Close()
+					}
+				}()
+			} else {
+				if w, _ := t.NextWriter(message.MessageText, parser.NOOP); w != nil {
+					w.Close()
+				}
 			}
 			newWriter = u.NextWriter
 		}
-		if w, _ := newWriter(message.MessageText, parser.PONG); w != nil {
-			io.Copy(w, r)
-			w.Close()
+
+		if KK {
+			func() {
+				c.writerLocker.Lock()
+				defer c.writerLocker.Unlock()
+				if w, _ := newWriter(message.MessageText, parser.PONG); w != nil {
+					io.Copy(w, r)
+					w.Close()
+				}
+			}()
+		} else {
+			if w, _ := newWriter(message.MessageText, parser.PONG); w != nil {
+				io.Copy(w, r)
+				w.Close()
+			}
 		}
 		fallthrough
 	case parser.PONG:
@@ -213,7 +277,7 @@ func (c *serverConn) OnPacket(r *parser.PacketDecoder) {
 		r.Close()
 	case parser.UPGRADE:
 		c.upgraded()
-	case parser.NOOP:
+
 	}
 }
 

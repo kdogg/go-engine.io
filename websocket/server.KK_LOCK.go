@@ -1,18 +1,23 @@
-// +build orig
-
 package websocket
 
 import (
 	"io"
 	"net/http"
 
+	"fmt"
 	"github.com/googollee/go-engine.io/message"
 	"github.com/googollee/go-engine.io/parser"
 	"github.com/googollee/go-engine.io/transport"
 	"github.com/gorilla/websocket"
+
+	"sync" // KK
 )
 
+const KK = true
+
 type Server struct {
+	mut sync.Mutex // KK
+
 	callback transport.Callback
 	conn     *websocket.Conn
 }
@@ -23,7 +28,12 @@ func NewServer(w http.ResponseWriter, r *http.Request, callback transport.Callba
 		return nil, err
 	}
 
+	fmt.Printf("****************************  engine.io UPGRADED to websocket ***************************\n")
+
 	ret := &Server{
+
+		mut: sync.Mutex{}, // KK
+
 		callback: callback,
 		conn:     conn,
 	}
@@ -43,7 +53,13 @@ func (s *Server) NextWriter(msgType message.MessageType, packetType parser.Packe
 		wsType, newEncoder = websocket.BinaryMessage, parser.NewBinaryEncoder
 	}
 
-	w, err := s.conn.NextWriter(wsType)
+	w, err := func() (io.WriteCloser, error) { // KK
+		s.mut.Lock()
+		defer s.mut.Unlock()
+		w, err := s.conn.NextWriter(wsType)
+		return w, err
+	}()
+
 	if err != nil {
 		return nil, err
 	}
@@ -55,6 +71,11 @@ func (s *Server) NextWriter(msgType message.MessageType, packetType parser.Packe
 }
 
 func (s *Server) Close() error {
+	if KK {
+		s.mut.Lock()
+		defer s.mut.Unlock()
+	}
+
 	return s.conn.Close()
 }
 
